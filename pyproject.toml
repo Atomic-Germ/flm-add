@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flm-add"
-version = "0.1.0"
+version = "0.2.0"
 description = "Install a pre-converted FLM (Q4NX) model and register it with FastFlowLM"
 readme = "README.md"
 requires-python = ">=3.8"
