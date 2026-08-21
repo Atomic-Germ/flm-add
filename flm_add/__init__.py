@@ -10,7 +10,8 @@ tokenizer.json, tokenizer_config.json, optionally chat_template.jinja):
     python3 flm-add.py Atomic-Germ/Qwen3.5-9B-Claude-4.8-Opus-NPU2
 
 Repo can be a Hugging Face repo id, a ModelScope repo id (--modelscope), a full
-Hugging Face URL, or a local directory holding the model files. The tag is
+Hugging Face URL, a ModelScope URL (www.modelscope.ai/.cn -- implies ModelScope
+without the flag), or a local directory holding the model files. The tag is
 derived from the repo name (e.g. Qwen3.5-9B-Claude-4.8-Opus-NPU2 ->
 qwen3.5-claude:9b); override with --tag. Defaults for the registry entry
 (family, engine, size, context length) are copied from the matching official
@@ -307,10 +308,49 @@ def _hf_headers():
     return headers
 
 
-def _http_get_json(url):
-    req = urllib.request.Request(url, headers=_hf_headers())
+def _ms_headers():
+    # Never forward Hugging Face credentials to ModelScope hosts.
+    return {"User-Agent": "flm-add/1.0"}
+
+
+def _http_get_json(url, headers=None):
+    req = urllib.request.Request(url, headers=headers if headers is not None else _hf_headers())
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+MODELSCOPE_HOSTS = ("modelscope.ai", "modelscope.cn", "modelscope.com")
+# Repos live on either hub (the international .ai site and the original .cn
+# site are separate registries), so query both before giving up.
+MS_DOMAINS = ["modelscope.ai", "modelscope.cn"]
+
+
+def is_modelscope_host(host):
+    host = host.lower()
+    return any(host == h or host.endswith("." + h) for h in MODELSCOPE_HOSTS)
+
+
+URL_PATH_CUTS = ("resolve", "blob", "tree", "commit", "files", "discuss")
+
+
+def split_remote_repo(raw):
+    """Classify an http(s) model URL: returns (host_kind, "Org/Name").
+
+    host_kind is 'modelscope' or 'huggingface'; a ModelScope URL therefore
+    implies ModelScope without --modelscope. Bare Org/Name arguments are not
+    URLs and must be classified by the caller (default: Hugging Face).
+    """
+    if not raw.startswith(("https://", "http://")):
+        return "huggingface", raw
+    host, _, path = raw.split("://", 1)[1].partition("/")
+    segs = [s for s in path.split("/") if s]
+    for cut in URL_PATH_CUTS:
+        if cut in segs:
+            segs = segs[: segs.index(cut)]
+    if segs and segs[0] == "models":
+        segs = segs[1:]
+    kind = "modelscope" if is_modelscope_host(host) else "huggingface"
+    return kind, "/".join(segs[:2])
 
 
 def hf_file_tree(repo_id):
@@ -318,8 +358,29 @@ def hf_file_tree(repo_id):
 
 
 def ms_file_tree(repo_id):
-    return _http_get_json(
-        f"https://modelscope.cn/api/v1/models/{repo_id}/repo/files?Revision=master&Recursive=false"
+    """Root-level file listing from ModelScope.
+
+    Returns (domain, {name: meta}) where meta carries Size/Sha256 for download
+    verification. Tries each known hub domain; raises SystemExit when the repo
+    is found on none of them.
+    """
+    errors = []
+    for domain in MS_DOMAINS:
+        url = (
+            f"https://{domain}/api/v1/models/{repo_id}"
+            "/repo/files?Revision=master&Recursive=false"
+        )
+        try:
+            tree = _http_get_json(url, headers=_ms_headers())
+        except Exception as e:
+            errors.append(f"{domain}: {e}")
+            continue
+        files = ((tree.get("Data") or {}).get("Files")) or []
+        if tree.get("Code") == 200 and files:
+            return domain, {f["Path"]: f for f in files if f.get("Path")}
+        errors.append(f"{domain}: {tree.get('Message') or 'not found'}")
+    raise SystemExit(
+        f"ModelScope repo not found ({repo_id}). Tried: " + "; ".join(errors)
     )
 
 
@@ -349,8 +410,33 @@ def hf_cache_snapshot(repo_id):
     return None
 
 
-def download_file(url, dest, expected_size=None, expected_sha=None, verify=True, quiet=False):
-    req = urllib.request.Request(url, headers=_hf_headers())
+def ms_cache_snapshot(repo_id):
+    """Local ModelScope SDK cache dir holding this repo's files (or None).
+
+    The SDK stores plain files directly under <cache>/models/<org>/<name>
+    (newer releases) or <cache>/<org>/<name> (legacy), so unlike the HF flow
+    there are no snapshot/blob indirections to resolve.
+    """
+    org, _, name = repo_id.partition("/")
+    roots = []
+    env = os.environ.get("MODELSCOPE_CACHE")
+    if env:
+        roots.append(Path(env))
+    roots.append(Path.home() / ".cache" / "modelscope")
+    candidates = []
+    for root in roots:
+        base = root if root.name == "modelscope" else root
+        candidates += [base / "models", base]
+    for base in candidates:
+        d = base / org / name
+        if (d / "config.json").is_file():
+            return d
+    return None
+
+
+def download_file(url, dest, expected_size=None, expected_sha=None, verify=True, quiet=False,
+                  headers=None):
+    req = urllib.request.Request(url, headers=headers if headers is not None else _hf_headers())
     tmp = str(dest) + ".part"
     written = 0
     with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
@@ -388,13 +474,9 @@ def download_file(url, dest, expected_size=None, expected_sha=None, verify=True,
 def fetch_assets(repo_id, target, modelscope=False, verify=True, force=False, quiet=False):
     """Populate target/ with the model files; returns the list of files present."""
     obtained = []
+    target.mkdir(parents=True, exist_ok=True)
     if modelscope:
-        tree = ms_file_tree(repo_id)
-        entries = {}
-        for e in tree.get("Data", []):
-            p = e.get("Path") or e.get("Name")
-            if p and "/" not in p:
-                entries[p] = {}
+        domain, entries = ms_file_tree(repo_id)
         for fname in ALL_FILES:
             if fname not in entries:
                 continue
@@ -402,12 +484,20 @@ def fetch_assets(repo_id, target, modelscope=False, verify=True, force=False, qu
             if dest.is_file() and not force:
                 obtained.append(fname)
                 continue
-            log(f"Downloading {fname} from ModelScope...")
+            meta = entries[fname]
+            expected_size = meta.get("Size") or None
+            expected_sha = (meta.get("Sha256") or "").lower() or None
+            if not quiet:
+                gb = f" ({expected_size / 1e9:.2f} GB)" if expected_size else ""
+                log(f"Downloading {fname}{gb} from ModelScope ({domain})...")
             download_file(
-                f"https://modelscope.cn/models/{repo_id}/resolve/master/{fname}",
+                f"https://{domain}/models/{repo_id}/resolve/master/{fname}",
                 dest,
+                expected_size=expected_size,
+                expected_sha=expected_sha,
                 verify=verify,
                 quiet=quiet,
+                headers=_ms_headers(),
             )
             obtained.append(fname)
         return obtained
@@ -558,7 +648,7 @@ def main():
     ap.add_argument("--xclbin-dir", help="user xclbins directory (default: ~/.config/flm/xclbins)")
     ap.add_argument("--xclbin-from", help="official model directory name to link xclbins from (default: best match, e.g. Qwen3.6-35B-A3B-NPU2)")
     ap.add_argument("--system-list", help="official model_list.json used for defaults (default: auto-detect)")
-    ap.add_argument("--modelscope", action="store_true", help="Treat REPO as a ModelScope repo id")
+    ap.add_argument("--modelscope", action="store_true", help="Treat REPO as a ModelScope repo id (implied by www.modelscope.ai/.cn URLs)")
     ap.add_argument("--no-xclbin", action="store_true", help="Do not create the xclbins symlink")
     ap.add_argument("--no-verify", action="store_true", help="Skip sha256 verification of downloads")
     ap.add_argument("--force", action="store_true", help="Overwrite existing model files/links")
@@ -566,11 +656,18 @@ def main():
     ap.add_argument("--quiet", action="store_true", help="Less output")
     args = ap.parse_args()
 
-    repo = args.repo
-    if repo.startswith(("https://", "http://")):
-        repo = repo.split("/", 3)[-1]
-    local_dir = Path(repo) if os.path.isdir(repo) else None
-    dir_name = local_dir.name if local_dir else repo.split("/")[-1]
+    # Hugging Face is the default hub; --modelscope opts in explicitly and a
+    # modelscope.ai/.cn URL implies it on its own.
+    modelscope = args.modelscope
+    repo_arg = args.repo
+    local_dir = Path(repo_arg) if os.path.isdir(repo_arg) else None
+    if local_dir:
+        repo, dir_name = repo_arg, local_dir.name
+    else:
+        host_kind, repo = split_remote_repo(repo_arg)
+        if host_kind == "modelscope":
+            modelscope = True
+        dir_name = repo.split("/")[-1]
     if not dir_name:
         raise SystemExit("Could not determine a model directory name from the repo.")
 
@@ -614,10 +711,10 @@ def main():
         target.mkdir(parents=True, exist_ok=True)
         files = copy_from_dir(local_dir, target, force=args.force)
     else:
-        snapshot = None if args.modelscope else hf_cache_snapshot(repo)
+        snapshot = ms_cache_snapshot(repo) if modelscope else hf_cache_snapshot(repo)
         if snapshot:
             if not args.quiet:
-                log(f"[INFO] Found local HF cache: {snapshot}")
+                log(f"[INFO] Found local {'ModelScope' if modelscope else 'HF'} cache: {snapshot}")
             target.mkdir(parents=True, exist_ok=True)
             files = copy_from_dir(snapshot, target, force=args.force)
         else:

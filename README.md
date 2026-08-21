@@ -22,6 +22,17 @@ flm-add Atomic-Germ/Qwen3.5-9B-Claude-4.8-Opus-NPU2 --tag qwen3.5-claude:9b
 
 The `--tag` argument must match the entry in FastFlowLM's model registry (e.g., `qwen3.5-claude:9b`, `gptoss-distill:20b`). Run `flm-add --help` to see all options.
 
+### From a ModelScope repo
+
+Hugging Face is the default hub; pass `--modelscope` for a bare repo id, or just paste a ModelScope URL and it is detected automatically:
+
+```bash
+flm-add --modelscope Atomic-Germ/Ornith-1.0-9B-NPU2 --family qwen3.5
+flm-add https://www.modelscope.ai/models/Atomic-Germ/Ornith-1.0-9B-NPU2 --family qwen3.5
+```
+
+Both the international hub (`modelscope.ai`) and the original one (`modelscope.cn`) are queried, and downloads are size- and sha256-verified like the Hugging Face path. A local ModelScope SDK cache (`~/.cache/modelscope`) is used when present.
+
 ### From a local checkout
 
 If you've already cloned or downloaded a repo containing the required files (`config.json`, `model.q4nx`, `tokenizer.json`, `tokenizer_config.json`), and optionally `chat_template.jinja`:
